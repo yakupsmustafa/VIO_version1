@@ -63,7 +63,7 @@ std::vector<std::vector<std::vector<double>>> synchronizeData(
 // ---- ORB extractor'i olusturur ----
 ORBExtractor buildExtractor() {
     ORBParams params;
-    params.nfeatures = 2000;
+    params.nfeatures = 10000;
     params.scaleFactor = 1.2f;
     params.nlevels = 8;
     params.edgeThreshold = 31;
@@ -98,6 +98,16 @@ cv::Mat buildCameraMatrix() {
     return (cv::Mat_<double>(3,3) << fx, 0, cx, 0, fy, cy, 0,  0,  1);
 }
 
+// ---- Kameradan govdeye (body frame) rotasyon - cam0/sensor.yaml'daki GERCEK T_BS'den ----
+// VO, kameranin KENDI koordinat sisteminde ilerliyor; GT ise govde (body) koordinat sisteminde.
+// Bu rotasyon uygulanmazsa, iki yorunge birbirine gore donmus/aynalanmis gorunur.
+cv::Mat buildCameraToBodyRotation() {
+    return (cv::Mat_<double>(3,3) <<
+        0.0148655429818, -0.999880929698,  0.00414029679422,
+        0.999557249008,   0.0149672133247, 0.025715529948,
+       -0.0257744366974,  0.00375618835797, 0.999660727178);
+}
+
 // ---- PoseEstimator'i olusturur ----
 PoseEstimator buildPoseEstimator(const cv::Mat& K) {
     EssentialMatParams params;
@@ -115,17 +125,44 @@ TrajectoryViewer buildViewer() {
     ViewerParams vparams;
     vparams.showFrame = true;
     vparams.showTrajectory = true;
+    vparams.frameWindowName = "Kamera Goruntusu";
+    vparams.trajWindowName = "Yorunge (VO vs GT)";
+    vparams.waitKeyDelay = 1;
+
     vparams.canvasSize = 800;
-    vparams.trajScale = 3.0;
+    vparams.trajScale = 3.0; // autoFit=true iken bu deger otomatik hesaplanir, elle vermene gerek yok
+    vparams.voColor = cv::Scalar(0, 255, 0);
+    vparams.gtColor = cv::Scalar(0, 0, 255);
+    vparams.pointRadius = 2;
+    vparams.lineThickness = 2;
+
+    // ---- GT gorsel olcekleme ----
+    vparams.autoScaleGT = true;      // false yaparsan manualGtScale kullanilir
+    vparams.manualGtScale = 20.0;     // autoScaleGT=false iken GT'ye uygulanacak SABIT olcek
+    vparams.minGtPathLength = 1e-6;
+    vparams.voRotationDeg = -75.0; // istediğin açı, derece cinsinden
+
+    // ---- Otomatik yakinlastirma ----
+    vparams.autoFit = true;
+    vparams.fitMargin = 0.15;
+    vparams.lateralBoost = 1.0;      // X eksenini bagimsiz buyutmek istersen >1 yap
+
+    // ---- Eksen isareti duzeltmesi: GT'nin X ekseni VO'ya gore ters gozlemlendigi icin aynalandi ----
+    vparams.gtAxisSign = cv::Vec3d(1, 1, 1); // artik R_BS geometrik olarak dogru donusumu yapiyor, hileye gerek yok
+
+    // ---- Metrikler ----
     vparams.showMetrics = true;
     vparams.computeLiveATE = true;
     vparams.ateUpdateInterval = 10;
+    vparams.minPointsForATE = 3;
+
     return TrajectoryViewer(vparams);
 }
 
 // ---- Tum kareler icin feature extraction + ardisik matching + poz zincirleme + canli gorsellestirme ----
 void processFrames(const ImageLoader& images, ORBExtractor& extractor,
                     FeatureMatcher& matcher, PoseEstimator& poseEst,
+                    const cv::Mat& R_BS,
                     const std::vector<std::vector<double>>& alignedGt,
                     TrajectoryViewer& viewer) {
     std::vector<cv::KeyPoint> prevKps;
@@ -163,7 +200,9 @@ void processFrames(const ImageLoader& images, ORBExtractor& extractor,
         }
 
         // ---- VO ve GT konumlarini viewer'a gonder (TEK SATIR CAGRI) ----
-        cv::Point3d voPos(chainedT.at<double>(0), chainedT.at<double>(1), chainedT.at<double>(2));
+        // chainedT kamera cercevesinde - R_BS ile govde (GT ile ayni) cercevesine cevriliyor
+        cv::Mat voBody = R_BS * chainedT;
+        cv::Point3d voPos(voBody.at<double>(0), voBody.at<double>(1), voBody.at<double>(2));
         std::optional<cv::Point3d> gtPos;
         if (i < alignedGt.size() && alignedGt[i].size() == 3) {
             gtPos = cv::Point3d(alignedGt[i][0], alignedGt[i][1], alignedGt[i][2]);
@@ -173,6 +212,13 @@ void processFrames(const ImageLoader& images, ORBExtractor& extractor,
         prevKps = kps;
         prevDescs = descs;
         hasPrev = true;
+
+        // ---- 'q' tusuna basilirsa dongudden cikip programi duzgunce sonlandir ----
+        int key = cv::waitKey(1) & 0xFF;
+        if (key == 'q' || key == 'Q') {
+            std::cout << "'q' tusuna basildi, cikiliyor...\n";
+            break;
+        }
     }
 }
 
@@ -192,10 +238,11 @@ int main() {
     ORBExtractor extractor = buildExtractor();
     FeatureMatcher matcher = buildMatcher();
     cv::Mat K = buildCameraMatrix();
+    cv::Mat R_BS = buildCameraToBodyRotation();
     PoseEstimator poseEst = buildPoseEstimator(K);
     TrajectoryViewer viewer = buildViewer();
 
-    processFrames(images, extractor, matcher, poseEst, alignedGt, viewer);
+    processFrames(images, extractor, matcher, poseEst, R_BS, alignedGt, viewer);
 
     std::cout << "Bitti.\n";
     return 0;
