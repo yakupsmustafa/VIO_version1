@@ -1,140 +1,202 @@
-#include "TimestampedDataSource.hpp"
-#include "DataLoaders.hpp"
-#include "Synchronizer.hpp"
-#include "Config.hpp"
-#include "FeatureExtractor.hpp"
-#include "FeatureMatcher.hpp"
-#include "PoseEstimator.hpp"
-#include "ScalePropagation.hpp"
-#include "BundleAdjustment.hpp"
-#include "ImuFusion.hpp"
-#include "MathUtils.hpp"
-#include "Metrics.hpp"
-#include "SimplePlotter.hpp"
+//
+//  main.cpp
+//  VisualOdometry
+//
+//  Created by asd on 18.08.2026.
+//
 #include <opencv2/opencv.hpp>
 #include <iostream>
-#include <deque>
+#include "Metrics.h"
+#include "pip01_FeatureExtractor.h"
+#include "DataLoader.h"
+#include "TimestampedDataSource.hpp"
+#include "Synchronizer.hpp"
+#include "pip02_Matcher.hpp"
+#include "pip03_PoseEstimator.hpp"
+#include "Test.hpp"
+
+// ---- Veri yollarini tutan yapi ----
+struct DatasetPaths {
+    std::string imageFolder;
+    std::string imuCsvPath;
+    std::string gtCsvPath;
+};
+
+DatasetPaths buildDatasetPaths(const std::string& datasetRoot) {
+    DatasetPaths paths;
+    paths.imageFolder = datasetRoot + "/cam0_frames";
+    paths.imuCsvPath  = datasetRoot + "/imu.csv";
+    paths.gtCsvPath    = datasetRoot + "/ground_truth.csv";
+    return paths;
+}
+
+// ---- Goruntuleri yukler ----
+ImageLoader loadImages(const std::string& imageFolder, int nFrames) {
+    std::cout << "Goruntuler yukleniyor...\n";
+    ImageLoader images(imageFolder, nFrames);
+    std::cout << "Toplam goruntu: " << images.imageFiles.size() << "\n";
+    return images;
+}
+
+// ---- IMU verisini yukler ----
+CSVImuSource loadImu(const std::string& imuCsvPath) {
+    std::cout << "IMU verisi yukleniyor...\n";
+    return CSVImuSource(imuCsvPath);
+}
+
+// ---- Ground truth verisini yukler ----
+CSVGroundTruthSource loadGroundTruth(const std::string& gtCsvPath) {
+    std::cout << "Ground truth yukleniyor...\n";
+    return CSVGroundTruthSource(gtCsvPath);
+}
+
+// ---- IMU ve GT'yi goruntu zaman damgalarina hizalar ----
+std::vector<std::vector<std::vector<double>>> synchronizeData(
+        const ImageLoader& images, const CSVImuSource& imu, const CSVGroundTruthSource& gt) {
+    Synchronizer sync(images, {&imu, &gt});
+    auto aligned = sync.alignAll();
+    std::cout << "Hizalanan IMU orneği: " << aligned[0].size() << "\n";
+    std::cout << "Hizalanan GT orneği: "  << aligned[1].size() << "\n";
+    return aligned;
+}
+
+// ---- ORB extractor'i olusturur ----
+ORBExtractor buildExtractor() {
+    ORBParams params;
+    params.nfeatures = 2000;
+    params.scaleFactor = 1.2f;
+    params.nlevels = 8;
+    params.edgeThreshold = 31;
+    params.firstLevel = 0;
+    params.WTA_K = 2;
+    params.scoreType = cv::ORB::HARRIS_SCORE;
+    params.patchSize = 31;
+    params.fastThreshold = 15;
+    return ORBExtractor(params);
+}
+
+// ---- Matcher'i olusturur ----
+FeatureMatcher buildMatcher() {
+    MatcherParams mparams;
+    mparams.normType = cv::NORM_HAMMING;
+    mparams.crossCheck = false;
+    mparams.useRatioTest = true;
+    mparams.ratioThresh = 0.75f;
+    mparams.knnK = 2;
+    mparams.useRadiusMatch = false;
+    mparams.maxDistance = 30.0f;
+    return FeatureMatcher(mparams);
+}
+
+// ---- Kamera kalibrasyon matrisini olusturur ----
+// NOT: Bu degerler EuRoC MH01 cam0'in bilinen yaklasik kalibrasyonudur.
+// Kendi ground_truth.csv/imu.csv ile birlikte gelen GERCEK kalibrasyon dosyan
+// varsa (ornegin cam0/sensor.yaml gibi) fx,fy,cx,cy degerlerini oradan al.
+cv::Mat buildCameraMatrix() {
+    double fx = 458.654, fy = 457.296;
+    double cx = 367.215, cy = 248.375;
+    return (cv::Mat_<double>(3,3) << fx, 0, cx, 0, fy, cy, 0,  0,  1);
+}
+
+// ---- PoseEstimator'i olusturur ----
+PoseEstimator buildPoseEstimator(const cv::Mat& K) {
+    EssentialMatParams params;
+    params.method = cv::RANSAC;
+    params.prob = 0.999;
+    params.threshold = 1.0;
+    params.maxIters = 1000;
+    params.recoverPoseDistanceThresh = 50.0;
+    params.computeTriangulatedPoints = false;
+    return PoseEstimator(K, params);
+}
+
+// ---- TrajectoryViewer'i olusturur ----
+TrajectoryViewer buildViewer() {
+    ViewerParams vparams;
+    vparams.showFrame = true;
+    vparams.showTrajectory = true;
+    vparams.canvasSize = 800;
+    vparams.trajScale = 3.0;
+    vparams.showMetrics = true;
+    vparams.computeLiveATE = true;
+    vparams.ateUpdateInterval = 10;
+    return TrajectoryViewer(vparams);
+}
+
+// ---- Tum kareler icin feature extraction + ardisik matching + poz zincirleme + canli gorsellestirme ----
+void processFrames(const ImageLoader& images, ORBExtractor& extractor,
+                    FeatureMatcher& matcher, PoseEstimator& poseEst,
+                    const std::vector<std::vector<double>>& alignedGt,
+                    TrajectoryViewer& viewer) {
+    std::vector<cv::KeyPoint> prevKps;
+    cv::Mat prevDescs;
+    bool hasPrev = false;
+
+    // Mutlak poz zincirleme icin baslangic degerleri (kare 0 = referans/orijin)
+    cv::Mat chainedR = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat chainedT = cv::Mat::zeros(3, 1, CV_64F);
+
+    for (size_t i = 0; i < images.imageFiles.size(); ++i) {
+        cv::Mat image = cv::imread(images.imageFiles[i], cv::IMREAD_GRAYSCALE);
+        if (image.empty()) {
+            std::cerr << "HATA: goruntu okunamadi: " << images.imageFiles[i] << "\n";
+            continue;
+        }
+
+        std::vector<cv::KeyPoint> kps;
+        cv::Mat descs;
+        extractor.detect(image, kps, descs);
+        std::cout << "Kare " << i << " -> bulunan kose sayisi: " << kps.size() << "\n";
+
+        if (hasPrev) {
+            std::vector<cv::DMatch> matches = matcher.match(prevDescs, descs);
+            std::cout << "  Kare " << (i - 1) << " -> " << i << " eslesme sayisi: " << matches.size() << "\n";
+
+            auto pose = poseEst.estimate(prevKps, kps, matches);
+            if (pose) {
+                // ---- Goreli pozu mutlak pozla zincirle ----
+                chainedT = pose->R * chainedT + pose->t;
+                chainedR = pose->R * chainedR;
+            } else {
+                std::cout << "  UYARI: poz tahmini basarisiz (yetersiz eslesme/inlier), onceki poz korunuyor\n";
+            }
+        }
+
+        // ---- VO ve GT konumlarini viewer'a gonder (TEK SATIR CAGRI) ----
+        cv::Point3d voPos(chainedT.at<double>(0), chainedT.at<double>(1), chainedT.at<double>(2));
+        std::optional<cv::Point3d> gtPos;
+        if (i < alignedGt.size() && alignedGt[i].size() == 3) {
+            gtPos = cv::Point3d(alignedGt[i][0], alignedGt[i][1], alignedGt[i][2]);
+        }
+        viewer.update(image, voPos, gtPos);
+
+        prevKps = kps;
+        prevDescs = descs;
+        hasPrev = true;
+    }
+}
 
 int main() {
-    Config cfg = Config::load("config.json");
+    const std::string datasetRoot = "../EUROC_MH01_Easy";
+    const int nFrames = 800;
 
-    ImageLoader images(cfg.imageFolder, cfg.nFrames);
-    CSVGroundTruthSource gt(cfg.gtCsvPath);
-    CSVImuSource imu(cfg.imuCsvPath);
+    DatasetPaths paths = buildDatasetPaths(datasetRoot);
 
-    std::cout << "Toplam " << images.imageFiles.size() << " goruntu, "
-              << gt.timestamps.size() << " GT, " << imu.timestamps.size() << " IMU satiri.\n";
+    ImageLoader images = loadImages(paths.imageFolder, nFrames);
+    CSVImuSource imu = loadImu(paths.imuCsvPath);
+    CSVGroundTruthSource gt = loadGroundTruth(paths.gtCsvPath);
 
-    Synchronizer sync(images, {&gt});
-    auto results = sync.alignAll();
-    auto& gtAligned = results[0];
+    auto aligned = synchronizeData(images, imu, gt);
+    const auto& alignedGt = aligned[1]; // 0: imu, 1: gt (synchronizeData'daki sira ile ayni)
 
-    FeatureExtractor extractor(cfg);
-    FeatureMatcher matcher(cfg);
-    PoseEstimator poseEstimator(cfg);
-    TrajectoryTracker tracker;
-    SimplePlotter plotter;
+    ORBExtractor extractor = buildExtractor();
+    FeatureMatcher matcher = buildMatcher();
+    cv::Mat K = buildCameraMatrix();
+    PoseEstimator poseEst = buildPoseEstimator(K);
+    TrajectoryViewer viewer = buildViewer();
 
-    std::optional<ScalePropagation> scaleProp;
-    std::optional<BundleAdjustment> bundleAdj;
-    if (cfg.translationMethod == "scale_propagation") scaleProp.emplace(cfg.K);
-    if (cfg.translationMethod == "bundle_adjustment") bundleAdj.emplace(cfg.K, 5);
+    processFrames(images, extractor, matcher, poseEst, alignedGt, viewer);
 
-    std::optional<ImuFusion> imuFusion;
-    if (cfg.useImuFusion) imuFusion.emplace(imu);
-
-    cv::Mat grayPrev = cv::imread(images.imageFiles[0], cv::IMREAD_GRAYSCALE);
-    std::vector<cv::KeyPoint> kpPrev, kpPrevPrev;
-    cv::Mat desPrev, desCur;
-    extractor.detect(grayPrev, kpPrev, desPrev);
-
-    std::vector<cv::DMatch> matchesHist;
-    std::deque<std::vector<cv::KeyPoint>> windowKps{kpPrev};
-    std::deque<std::vector<cv::DMatch>> windowMatches;
-    auto tStart = std::chrono::steady_clock::now();
-    int processedFrames = 0;
-    for (int i = 1; i < (int)images.imageFiles.size(); ++i) {
-        processedFrames ++;
-        cv::Mat grayCur = cv::imread(images.imageFiles[i], cv::IMREAD_GRAYSCALE);
-        std::vector<cv::KeyPoint> kpCur;
-        extractor.detect(grayCur, kpCur, desCur);
-
-        std::optional<RelativePose> rel;
-        std::vector<cv::DMatch> matches;
-
-        if (!desPrev.empty() && !desCur.empty() && kpPrev.size() >= 8 && kpCur.size() >= 8) {
-            matches = matcher.match(desPrev, desCur);
-            rel = poseEstimator.estimate(kpPrev, kpCur, matches);
-
-            if (rel && scaleProp && !kpPrevPrev.empty() && !matchesHist.empty()) {
-                double scale = scaleProp->estimateScale(kpPrevPrev, kpPrev, kpCur, matchesHist, matches);
-                rel->t *= scale;
-            }
-        }
-
-        if (bundleAdj && !matches.empty()) {
-            windowKps.push_back(kpCur);
-            windowMatches.push_back(matches);
-            if ((int)windowKps.size() == 5) {
-                std::vector<std::vector<cv::KeyPoint>> kpVec(windowKps.begin(), windowKps.end());
-                std::vector<std::vector<cv::DMatch>> mVec(windowMatches.begin(), windowMatches.end());
-                auto baResult = bundleAdj->optimize(kpVec, mVec);
-                if (baResult) {
-                    auto& last = baResult->back();
-                    auto& prevLast = (*baResult)[baResult->size()-2];
-                    cv::Mat Rrel = last.R * prevLast.R.t();
-                    cv::Mat trel = last.t - Rrel * prevLast.t;
-                    rel = RelativePose{Rrel.t(), -Rrel.t() * trel};
-                }
-                windowKps.pop_front();
-                windowMatches.pop_front();
-            }
-        }
-
-        kpPrevPrev = kpPrev;
-        matchesHist = matches;
-        grayPrev = grayCur; kpPrev = kpCur; desPrev = desCur.clone();
-
-        if (imuFusion && rel) {
-            imuFusion->fuse(rel->R, rel->t, images.timestamps[i-1], images.timestamps[i]);
-        }
-        tracker.update(rel);
-
-        if (i % cfg.updateEvery == 0 || i == (int)images.imageFiles.size() - 1) {
-            int n = (int)tracker.positions.size();
-            Eigen::MatrixXd vo(n, 3), gtM(n, 3);
-            for (int k = 0; k < n; ++k) {
-                vo(k,0)=tracker.positions[k][0]; vo(k,1)=tracker.positions[k][1]; vo(k,2)=tracker.positions[k][2];
-                gtM(k,0)=gtAligned[k][0]; gtM(k,1)=gtAligned[k][1]; gtM(k,2)=gtAligned[k][2];
-            }
-
-            Eigen::MatrixXd T = umeyamaAlign(vo.transpose(), gtM.transpose());
-            Eigen::MatrixXd rotated = T.block(0,0,3,3) * vo.transpose();       // (3,N)
-            Eigen::MatrixXd voAligned = rotated.colwise() + T.block(0,3,3,1).col(0);  // (3,N)
-            voAligned.transposeInPlace();                                       // (N,3)'e cevir
-
-            double ate = computeATE(voAligned, gtM);
-
-            std::vector<cv::Point2d> gtPts, voPts;
-            for (int k = 0; k < n; ++k) {
-                gtPts.emplace_back(gtM(k,0), gtM(k,1));
-                voPts.emplace_back(voAligned(k,0), voAligned(k,1));
-            }
-            plotter.updateTrajectory(gtPts, voPts, "Kare " + std::to_string(i) + " ATE=" + std::to_string(ate));
-
-            cv::Mat kpImg;
-            cv::drawKeypoints(grayCur, kpCur, kpImg, cv::Scalar(0,255,255));
-            cv::imshow("Kamera", kpImg);
-            if (cv::waitKey(1) == 'q') break;
-        }
-    }
-    auto tEnd = std::chrono::steady_clock::now();
-    double totalSeconds = std::chrono::duration<double>(tEnd - tStart).count();
-    double fps = processedFrames / totalSeconds;
-    std::cout << "\n--- Sonuclar ---\n";
-    std::cout << "Toplam sure: " << totalSeconds << " saniye\n";
-    std::cout << "FPS: " << fps << "\n";
     std::cout << "Bitti.\n";
-    cv::waitKey(0);
     return 0;
 }
