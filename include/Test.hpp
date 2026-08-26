@@ -4,6 +4,7 @@
 #include <vector>
 #include <optional>
 #include <deque>
+#include <iostream>
 #include "MathUtils.hpp"
 #include "Metrics.h"
 
@@ -44,6 +45,11 @@ struct ViewerParams {
     // gore canvas'a TAM OTURACAK sekilde otomatik hesaplanir.
     bool autoFit = true;
     double fitMargin = 0.15; // kenarlarda birakilacak bosluk orani (0.15 = %15 pay)
+    // Tam yeniden-cizim (updateFitScale+redrawAll, maliyeti O(gecmis uzunlugu)) kac karede bir yapilsin.
+    // Aradaki karelerde mevcut (bir onceki tam-cizimden kalma) olcekle sadece yeni segment eklenir (O(1)).
+    // 800 karelik bir kosuda toplam cizim maliyetini ~N kati azaltir; bedeli: olcek en fazla N kare "bayat"
+    // kalabilir (yorunge aniden cok buyurse N kare boyunca hafif tasma/sikisma gorulebilir).
+    int autoFitInterval = 10;
 
     // ---- Yanal (X ekseni) abartma ----
     // 1.0 = normal, oranli. >1.0 = X eksenini Z'ye gore BAGIMSIZ buyutur (oran bozulur,
@@ -114,13 +120,34 @@ public:
         }
 
         if (params.autoFit) {
-            // ---- Otomatik yakinlastirma: butun gecmisi, guncel olcekle YENIDEN ciz ----
-            // Hizalanmis VO verisi varsa (Umeyama calisti) ONU kullan - GT ile ayni cerceve/yon/olcek.
-            updateFitScale();
-            redrawAll();
+            // ---- Tam yeniden-cizim (O(gecmis)) sadece her autoFitInterval karede bir yapilir ----
+            // (bkz. ViewerParams::autoFitInterval) - aradaki kareler ucuz incremental ekleme kullanir.
+            bool fullRedraw = (frameCount == 1) || (frameCount % params.autoFitInterval == 0);
+            if (fullRedraw) {
+                // ---- Otomatik yakinlastirma: butun gecmisi, guncel olcekle YENIDEN ciz ----
+                updateFitScale();
+                redrawAll();
+                // Throttle arasi incremental cizimin dogru noktadan devam etmesi icin referanslari guncelle
+                prevVoCanvas = toCanvas(rotateVo(alignVoForDraw(voPath.back())));
+                if (!gtPath.empty()) {
+                    cv::Point3d sp(gtPath.back().x * gtVisualScale,
+                                    gtPath.back().y * gtVisualScale,
+                                    gtPath.back().z * gtVisualScale);
+                    prevGtCanvas = toCanvas(sp);
+                }
+            } else {
+                // ---- Throttle arasi: bir onceki tam-cizimden kalma olcekle sadece yeni segmenti ekle ----
+                drawNewSegment(rotateVo(alignVoForDraw(voPos)), prevVoCanvas, params.voColor);
+                if (gtPosCorrected) {
+                    cv::Point3d scaledGt(gtPosCorrected->x * gtVisualScale,
+                                          gtPosCorrected->y * gtVisualScale,
+                                          gtPosCorrected->z * gtVisualScale);
+                    drawNewSegment(scaledGt, prevGtCanvas, params.gtColor);
+                }
+            }
         } else {
             // ---- Eski davranis: sabit olcek, sadece yeni segmenti ekle (hizli ama sabit) ----
-            drawNewSegment(rotateVo(voPos), prevVoCanvas, params.voColor);
+            drawNewSegment(rotateVo(alignVoForDraw(voPos)), prevVoCanvas, params.voColor);
             if (gtPosCorrected) {
                 cv::Point3d scaledGt(gtPosCorrected->x * gtVisualScale,
                                       gtPosCorrected->y * gtVisualScale,
@@ -134,6 +161,8 @@ public:
             (int)gtPath.size() >= params.minPointsForATE &&
             frameCount % params.ateUpdateInterval == 0) {
             lastATE = computeLiveATE();
+            std::cout << "[ATE] kare " << frameCount << ": " << lastATE
+                      << " (GT gorsel olcek: " << gtVisualScale << ")\n";
         }
 
         // ---- Metinlerle birlikte gosterilecek kopya olustur ----
@@ -172,7 +201,18 @@ private:
     bool hasPrevVoWorld = false, hasPrevGtWorld = false;
     double gtVisualScale = 1.0;
 
-    // VO noktasini X-Z duzleminde params.voRotationDeg kadar dondurur (sadece cizim icin)
+    // ---- Saklanan son Umeyama donusumunu (lastAlignT) TEK bir VO noktasina uygular (cizim icin) ----
+    // computeLiveATE'in ATE icin kullandigi AYNI hizalama - bu cagrilmadan VO ham (kendi keyfi
+    // baslangic-cercevesinde) cizilir ve GT ile gorsel olarak ORTUSMEZ, oysa ATE sayisi zaten
+    // hizalanmis veriyle hesaplaniyordu. Ilk hizalama olusana kadar (hasAlignment=false) ham dondurur.
+    cv::Point3d alignVoForDraw(const cv::Point3d& p) const {
+        if (!hasAlignment) return p;
+        Eigen::Vector4d ph(p.x, p.y, p.z, 1.0);
+        Eigen::Vector4d pa = lastAlignT * ph;
+        return cv::Point3d(pa[0], pa[1], pa[2]);
+    }
+
+    // VO noktasini X-Z duzleminde params.voRotationDeg kadar dondurur (sadece cizim icin, ekstra manuel ayar)
     cv::Point3d rotateVo(const cv::Point3d& p) const {
         if (params.voRotationDeg == 0.0) return p;
         double rad = params.voRotationDeg * CV_PI / 180.0;
@@ -194,7 +234,7 @@ private:
         bool any = false;
 
         for (auto& raw : voPath) {
-            cv::Point3d p = rotateVo(raw);
+            cv::Point3d p = rotateVo(alignVoForDraw(raw));
             minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
             minZ = std::min(minZ, p.z); maxZ = std::max(maxZ, p.z);
             any = true;
@@ -225,10 +265,10 @@ private:
     void redrawAll() {
         canvas = cv::Mat::zeros(params.canvasSize, params.canvasSize, CV_8UC3);
 
-        // VO, params.voRotationDeg kadar dondurulerek cizilir (sadece gorsel)
+        // VO, ATE'de kullanilan AYNI Umeyama hizalamasiyla (ve istege bagli manuel rotateVo ile) cizilir
         for (size_t i = 0; i < voPath.size(); ++i) {
-            cv::Point2d curr = toCanvas(rotateVo(voPath[i]));
-            if (i > 0) cv::line(canvas, toCanvas(rotateVo(voPath[i-1])), curr, params.voColor, params.lineThickness);
+            cv::Point2d curr = toCanvas(rotateVo(alignVoForDraw(voPath[i])));
+            if (i > 0) cv::line(canvas, toCanvas(rotateVo(alignVoForDraw(voPath[i-1]))), curr, params.voColor, params.lineThickness);
             cv::circle(canvas, curr, params.pointRadius, params.voColor, cv::FILLED);
         }
         // GT gorsel olcek ile buyutulerek cizilir (gtVisualScale)
@@ -278,18 +318,6 @@ private:
         hasAlignment = true;
 
         return computeATE(voAligned, gtMat);
-    }
-
-    // ---- Saklanan son donusumu, GUNCEL tum voPath'e uygular (her karede cagrilir, ucuz islem) ----
-    std::vector<cv::Point3d> alignedVoForDraw() const {
-        if (!hasAlignment) return voPath; // henuz ilk hizalama olmadi, ham goster
-        std::vector<cv::Point3d> out(voPath.size());
-        for (size_t i = 0; i < voPath.size(); ++i) {
-            Eigen::Vector4d ph(voPath[i].x, voPath[i].y, voPath[i].z, 1.0);
-            Eigen::Vector4d pa = lastAlignT * ph;
-            out[i] = cv::Point3d(pa[0], pa[1], pa[2]);
-        }
-        return out;
     }
 
     void drawMetrics(cv::Mat& display, double fps) {

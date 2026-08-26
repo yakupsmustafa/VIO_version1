@@ -16,13 +16,14 @@ public:
     }
 
     // np.argmin(np.abs(timestamps - ts)) karsiligi
+    // timestamps monoton artan siralı oldugundan (CSV/dosya adi sirasiyla geldigi gibi) binary search
+    // ile O(log N) - lower_bound, ts'den >= olan ilk elemani verir; gercek en yakin o ya da bir oncekidir.
     size_t closestIndex(int64_t ts) const {
-        size_t best = 0;
-        int64_t bestDiff = std::llabs(timestamps[0] - ts);
-        for (size_t i = 1; i < timestamps.size(); ++i) {
-            int64_t diff = std::llabs(timestamps[i] - ts);
-            if (diff < bestDiff) { bestDiff = diff; best = i; }
-        }
-        return best;
+        auto it = std::lower_bound(timestamps.begin(), timestamps.end(), ts);
+        if (it == timestamps.begin()) return 0;
+        if (it == timestamps.end()) return timestamps.size() - 1;
+        size_t after = it - timestamps.begin();
+        size_t before = after - 1;
+        return (std::llabs(timestamps[after] - ts) < std::llabs(timestamps[before] - ts)) ? after : before;
     }
 };
