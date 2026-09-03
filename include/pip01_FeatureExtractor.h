@@ -36,3 +36,18 @@ public:
         detector->detectAndCompute(grayImage, cv::noArray(), kps, descs);
     }
 };
+
+
+/* 
+ORB parametrelerinin tanımı:
+- nfeatures: Algılanacak maksimum köşe sayısı.
+- scaleFactor: Her seviye arasındaki ölçek faktörü. Örneğin, 1.2, bir sonraki seviyedeki görüntünün önceki seviyeye göre %20 daha küçük olacağı anlamına gelir.
+- nlevels: Görüntü piramidindeki seviye sayısı. Daha fazla seviye, daha fazla ölçeklenmiş özellikler anlamına gelir, ancak işlem süresi artar.
+- edgeThreshold: Kenar eşiği, köşe algılama sırasında kenarlara yakın bölgeleri filtrelemek için kullanılır. Daha yüksek bir değer, kenarlara daha yakın köşe algılamayı engeller.
+- firstLevel: Görüntü piramidindeki ilk seviyeyi belirler. Genellikle 0 olarak ayarlanır.
+- WTA_K: Hamming ağacı için kullanılan bit sayısı. 2 veya 3 olabilir. Daha yüksek bir değer, daha fazla bilgi sağlar ancak işlem süresini artırabilir.
+- scoreType: Köşe puanlama yöntemi. cv::ORB::HARRIS_SCORE veya cv::ORB::FAST_SCORE olabilir.  -HARRIS_SCORE, Harris köşe algılama yöntemini kullanır ve genellikle daha iyi sonuçlar verir.
+- patchSize: Köşe algılama sırasında kullanılan yama boyutu.
+- fastThreshold: FAST köşe algılama algoritması için eşik değeri. Daha düşük bir değer, daha fazla köşe algılanmasına neden olur, ancak yanlış pozitifleri artırabilir
+
+*/
